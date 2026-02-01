@@ -1,397 +1,493 @@
 const express = require('express');
-const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
 const cors = require('cors');
-const { exec } = require('child_process');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
+const sqlite3 = require('sqlite3').verbose();
+const { Octokit } = require('@octokit/rest');
+const QRCode = require('qrcode');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// **PERBAIKAN CORS UNTUK CHROME**
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    credentials: true,
-    optionsSuccessStatus: 200
-}));
+// Database setup
+const db = new sqlite3.Database('./database/vanilla.db');
 
-// Handle preflight requests
-app.options('*', cors());
+// Initialize database tables
+db.serialize(() => {
+    // Products table
+    db.run(`CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        price REAL,
+        category TEXT,
+        image_url TEXT,
+        file_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
 
+    // Orders table
+    db.run(`CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        customer_email TEXT,
+        amount REAL,
+        payment_method TEXT,
+        status TEXT DEFAULT 'pending',
+        payment_proof TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    )`);
+
+    // Users/Admin table
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        is_admin BOOLEAN DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Tokens table
+    db.run(`CREATE TABLE IF NOT EXISTS tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT UNIQUE,
+        platform TEXT,
+        source TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Bots table
+    db.run(`CREATE TABLE IF NOT EXISTS bots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        status TEXT,
+        last_online DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Create default admin user
+    const defaultPassword = bcrypt.hashSync('admin123', 10);
+    db.run(`INSERT OR IGNORE INTO users (username, password, is_admin) VALUES (?, ?, ?)`,
+        ['admin', defaultPassword, 1]);
+});
+
+// Middleware
+app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
 
-// **FIX: Buat folder uploads jika tidak ada**
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-}
-
-// Database untuk token
-const tokenDB = path.join(__dirname, 'tokens.db.json');
-
-// **FIX: Storage configuration yang lebih baik**
+// Multer configuration for file uploads
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        const uploadDir = path.join(__dirname, 'uploads');
-        // Bersihkan folder lama jika ada
-        if (fs.existsSync(path.join(uploadDir, 'latest'))) {
-            fs.rmSync(path.join(uploadDir, 'latest'), { recursive: true, force: true });
-        }
-        const newDir = path.join(uploadDir, 'latest');
-        fs.mkdirSync(newDir, { recursive: true });
-        cb(null, newDir);
+        const dir = 'uploads/';
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
     },
     filename: (req, file, cb) => {
-        // Bersihkan nama file dari karakter aneh
-        const cleanName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
-        cb(null, Date.now() + '_' + cleanName);
+        cb(null, Date.now() + '-' + file.originalname);
     }
 });
 
-const upload = multer({ 
-    storage: storage,
-    limits: {
-        fileSize: 100 * 1024 * 1024, // 100MB max
-        files: 100 // max 100 files
+const upload = multer({ storage });
+
+// Bot Control API Integration
+const BOT_API_URL = 'https://bot-control-server-production.up.railway.app';
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Access denied' });
+
+    jwt.verify(token, process.env.JWT_SECRET || 'vanilla-secret-key', (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// Admin middleware
+const isAdmin = (req, res, next) => {
+    if (!req.user || !req.user.isAdmin) {
+        return res.status(403).json({ error: 'Admin access required' });
     }
-});
+    next();
+};
 
-// In-memory bot storage
-let bots = [];
-let tokens = [];
+// ==================== AUTHENTICATION ENDPOINTS ====================
 
-// Load existing tokens
-if (fs.existsSync(tokenDB)) {
-    try {
-        tokens = JSON.parse(fs.readFileSync(tokenDB, 'utf8'));
-    } catch (e) {
-        tokens = [];
-    }
-}
-
-// Save tokens to file
-function saveTokens() {
-    fs.writeFileSync(tokenDB, JSON.stringify(tokens, null, 2));
-}
-
-// **FIX: Endpoint test untuk cek koneksi**
-app.get('/test', (req, res) => {
-    res.json({ 
-        status: 'online', 
-        message: 'Server is running',
-        timestamp: new Date().toISOString()
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    
+    db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+        if (err || !user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        const token = jwt.sign(
+            { userId: user.id, username: user.username, isAdmin: user.is_admin },
+            process.env.JWT_SECRET || 'vanilla-secret-key',
+            { expiresIn: '24h' }
+        );
+        
+        res.json({ token, user: { username: user.username, isAdmin: user.is_admin } });
     });
 });
 
-// **FIX: 1. Upload files/folders dengan response lebih detail**
-app.post('/upload', upload.array('files', 100), (req, res) => {
-    try {
-        const files = req.files;
-        
-        if (!files || files.length === 0) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'No files uploaded' 
+// ==================== PRODUCTS ENDPOINTS ====================
+
+// Get all products
+app.get('/api/products', (req, res) => {
+    db.all('SELECT * FROM products ORDER BY created_at DESC', (err, products) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json(products);
+    });
+});
+
+// Get single product
+app.get('/api/products/:id', (req, res) => {
+    db.get('SELECT * FROM products WHERE id = ?', [req.params.id], (err, product) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        if (!product) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+        res.json(product);
+    });
+});
+
+// Create product (Admin only)
+app.post('/api/products', authenticateToken, isAdmin, upload.single('image'), (req, res) => {
+    const { name, description, price, category } = req.body;
+    const image_url = req.file ? `/uploads/${req.file.filename}` : null;
+    
+    db.run(
+        `INSERT INTO products (name, description, price, category, image_url) VALUES (?, ?, ?, ?, ?)`,
+        [name, description, parseFloat(price), category, image_url],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ id: this.lastID, message: 'Product created successfully' });
+        }
+    );
+});
+
+// Update product (Admin only)
+app.put('/api/products/:id', authenticateToken, isAdmin, upload.single('image'), (req, res) => {
+    const { name, description, price, category } = req.body;
+    const productId = req.params.id;
+    
+    let image_url = null;
+    if (req.file) {
+        image_url = `/uploads/${req.file.filename}`;
+    }
+    
+    let query = `UPDATE products SET name = ?, description = ?, price = ?, category = ?`;
+    let params = [name, description, parseFloat(price), category];
+    
+    if (image_url) {
+        query += `, image_url = ?`;
+        params.push(image_url);
+    }
+    
+    query += `, updated_at = CURRENT_TIMESTAMP WHERE id = ?`;
+    params.push(productId);
+    
+    db.run(query, params, function(err) {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json({ message: 'Product updated successfully' });
+    });
+});
+
+// Delete product (Admin only)
+app.delete('/api/products/:id', authenticateToken, isAdmin, (req, res) => {
+    db.run('DELETE FROM products WHERE id = ?', [req.params.id], function(err) {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json({ message: 'Product deleted successfully' });
+    });
+});
+
+// ==================== ORDERS ENDPOINTS ====================
+
+// Create order
+app.post('/api/orders', upload.single('payment_proof'), (req, res) => {
+    const { product_id, customer_email, amount, payment_method } = req.body;
+    const payment_proof = req.file ? `/uploads/${req.file.filename}` : null;
+    
+    db.run(
+        `INSERT INTO orders (product_id, customer_email, amount, payment_method, payment_proof) VALUES (?, ?, ?, ?, ?)`,
+        [product_id, customer_email, parseFloat(amount), payment_method, payment_proof],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ 
+                id: this.lastID, 
+                message: 'Order created successfully',
+                status: 'pending'
             });
         }
-        
-        let allTokens = [];
-        
-        files.forEach(file => {
-            // Cek jika file adalah JavaScript
-            if (file.originalname.endsWith('.js') || file.mimetype === 'application/javascript') {
-                try {
-                    const content = fs.readFileSync(file.path, 'utf8');
-                    const foundTokens = extractTokens(content, file.originalname);
-                    allTokens.push(...foundTokens);
-                    
-                    // **AUTO DEPLOY jika file bot**
-                    if (content.includes('require(\'discord.js\')') || content.includes('const Discord = require')) {
-                        autoDeployBot(file, content);
-                    }
-                } catch (readError) {
-                    console.error('Error reading file:', readError);
-                }
+    );
+});
+
+// Get all orders (Admin only)
+app.get('/api/orders', authenticateToken, isAdmin, (req, res) => {
+    db.all(`
+        SELECT o.*, p.name as product_name 
+        FROM orders o 
+        LEFT JOIN products p ON o.product_id = p.id 
+        ORDER BY o.created_at DESC
+    `, (err, orders) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json(orders);
+    });
+});
+
+// Update order status (Admin only)
+app.put('/api/orders/:id/status', authenticateToken, isAdmin, (req, res) => {
+    const { status } = req.body;
+    
+    db.run(
+        `UPDATE orders SET status = ? WHERE id = ?`,
+        [status, req.params.id],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: err.message });
             }
-        });
-        
-        res.json({ 
-            success: true, 
-            count: files.length,
-            tokens: allTokens,
-            message: `Successfully uploaded ${files.length} file(s)`
-        });
-        
+            res.json({ message: 'Order status updated successfully' });
+        }
+    );
+});
+
+// ==================== BOT CONTROL ENDPOINTS ====================
+
+// Proxy to bot control server
+app.get('/api/bots', async (req, res) => {
+    try {
+        const response = await fetch(`${BOT_API_URL}/bots`);
+        const data = await response.json();
+        res.json(data);
     } catch (error) {
-        console.error('Upload error:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Upload failed: ' + error.message 
-        });
+        res.status(500).json({ error: 'Failed to fetch bots' });
     }
 });
 
-// **FIX: 2. Upload dengan drag & drop folder**
-app.post('/upload-folder', upload.array('files', 1000), (req, res) => {
-    const files = req.files;
-    const structure = req.body.structure ? JSON.parse(req.body.structure) : [];
-    
-    // Simpan struktur folder
-    const folderData = {
-        timestamp: new Date().toISOString(),
-        fileCount: files.length,
-        structure: structure,
-        files: files.map(f => ({
-            name: f.originalname,
-            size: f.size,
-            type: f.mimetype
-        }))
-    };
-    
-    fs.writeFileSync(
-    path.join(process.cwd(), 'uploads', 'latest', 'folder_structure.json'),
-    JSON.stringify(folderData, null, 2)
-);
-    
-    res.json({ 
-        success: true, 
-        message: `Folder uploaded with ${files.length} files`,
-        structure: structure
-    });
-});
-
-// **FIX: 3. Endpoint untuk mendapatkan file yang sudah diupload**
-app.get('/uploaded-files', (req, res) => {
-    const uploadDir = path.join(__dirname, 'uploads', 'latest');
-    const files = [];
-    
-    if (fs.existsSync(uploadDir)) {
-        const fileList = fs.readdirSync(uploadDir);
-        fileList.forEach(file => {
-            const filePath = path.join(uploadDir, file);
-            const stat = fs.statSync(filePath);
-            files.push({
-                name: file,
-                size: stat.size,
-                modified: stat.mtime,
-                path: filePath
-            });
-        });
-    }
-    
-    res.json(files);
-});
-
-// **FIX: 4. Deploy bot dengan validasi lebih baik**
-app.post('/deploy', upload.single('botFile'), (req, res) => {
+app.post('/api/bots/start', async (req, res) => {
     try {
-        const { botName, platform, botToken } = req.body;
-        const file = req.file;
+        const response = await fetch(`${BOT_API_URL}/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body)
+        });
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to start bot' });
+    }
+});
+
+app.post('/api/bots/stop', async (req, res) => {
+    try {
+        const response = await fetch(`${BOT_API_URL}/stop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body)
+        });
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to stop bot' });
+    }
+});
+
+app.get('/api/bots/logs', async (req, res) => {
+    try {
+        const response = await fetch(`${BOT_API_URL}/logs`);
+        const data = await response.json();
+        res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch logs' });
+    }
+});
+
+// ==================== DEPLOYMENT ENDPOINTS ====================
+
+// GitHub deployment endpoint
+app.post('/api/deploy/github', authenticateToken, async (req, res) => {
+    const { repo, branch, token } = req.body;
+    
+    try {
+        const octokit = new Octokit({ auth: token });
         
-        if (!file) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'No file provided' 
-            });
-        }
+        // Get repository info
+        const [owner, repoName] = repo.split('/');
+        const repoInfo = await octokit.repos.get({ owner, repo: repoName });
         
-        // Validasi file
-        if (!file.originalname.endsWith('.js')) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Only .js files are allowed' 
-            });
-        }
-        
-        // Save token jika ada
-        if (botToken && botToken.trim() !== '') {
-            const tokenExists = tokens.some(t => t.token === botToken.trim());
-            if (!tokenExists) {
-                tokens.push({
-                    token: botToken.trim(),
-                    source: 'manual_deploy',
-                    platform: platform || 'discord',
-                    botName: botName || 'Unnamed Bot',
-                    timestamp: new Date().toISOString(),
-                    active: true
-                });
-                saveTokens();
-            }
-        }
-        
-        // Create bot entry
-        const botId = 'bot_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
-        const bot = {
-            id: botId,
-            name: botName || path.basename(file.originalname, '.js'),
-            platform: platform || 'discord',
-            status: 'running',
-            filePath: file.path,
-            startTime: new Date().toISOString(),
-            pid: null
+        // Simulate deployment process
+        const deployment = {
+            id: Date.now(),
+            repo: repo,
+            branch: branch,
+            status: 'deploying',
+            url: `https://${repoName}-${owner}.vercel.app`,
+            createdAt: new Date().toISOString()
         };
         
-        bots.push(bot);
+        // Simulate build process
+        setTimeout(() => {
+            deployment.status = 'success';
+            // In production, you would integrate with Vercel/Railway API here
+        }, 3000);
         
-        // Start bot process
-        const process = startBotProcess(bot);
-        bot.pid = process.pid;
-        
-        res.json({ 
-            success: true, 
-            botId: bot.id,
-            message: `Bot ${bot.name} deployed successfully`,
-            details: {
-                name: bot.name,
-                platform: bot.platform,
-                file: file.originalname,
-                started: bot.startTime
-            }
+        res.json({
+            message: 'Deployment initiated',
+            deployment,
+            vercelUrl: `https://vercel.com/new?repository-url=https://github.com/${repo}`
         });
-        
     } catch (error) {
-        console.error('Deploy error:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Deployment failed: ' + error.message 
-        });
+        res.status(500).json({ error: 'GitHub deployment failed', details: error.message });
     }
 });
 
-// **FIX: 5. Get all bots dengan status lengkap**
-app.get('/bots', (req, res) => {
-    // Update status bot berdasarkan process yang masih running
-    bots.forEach(bot => {
-        if (bot.pid) {
-            try {
-                // Cek jika process masih hidup
-                process.kill(bot.pid, 0); // Signal 0 hanya untuk cek
-                bot.status = 'running';
-            } catch (e) {
-                bot.status = 'stopped';
-            }
-        }
-    });
-    
-    res.json(bots);
-});
+// ==================== QRIS PAYMENT ENDPOINT ====================
 
-// **NEW: 6. Get server status**
-app.get('/status', (req, res) => {
-    res.json({
-        status: 'online',
-        serverTime: new Date().toISOString(),
-        bots: bots.length,
-        tokens: tokens.length,
-        uptime: process.uptime(),
-        memory: process.memoryUsage()
-    });
-});
-
-// **FIX: Helper function untuk auto deploy**
-function autoDeployBot(file, content) {
-    const botId = 'auto_' + Date.now();
-    const botName = path.basename(file.originalname, '.js');
+app.post('/api/payment/qris', async (req, res) => {
+    const { amount, order_id } = req.body;
     
-    // Extract token dari file jika ada
-    const tokenRegex = /[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}/;
-    const tokenMatch = content.match(tokenRegex);
-    
-    if (tokenMatch) {
-        const token = tokenMatch[0];
-        if (!tokens.some(t => t.token === token)) {
-            tokens.push({
-                token: token,
-                source: 'auto_extract',
-                botName: botName,
-                timestamp: new Date().toISOString()
-            });
-            saveTokens();
-        }
-    }
-    
-    const bot = {
-        id: botId,
-        name: botName,
-        platform: 'discord',
-        status: 'running',
-        filePath: file.path,
-        startTime: new Date().toISOString(),
-        auto: true
-    };
-    
-    bots.push(bot);
-    startBotProcess(bot);
-    
-    console.log(`Auto-deployed bot: ${botName}`);
-}
-
-// **FIX: Fungsi startBotProcess yang lebih baik**
-function startBotProcess(bot) {
     try {
-        if (fs.existsSync(bot.filePath)) {
-            const child = exec(`node "${bot.filePath}"`, {
-                cwd: path.dirname(bot.filePath),
-                detached: true
-            });
-            
-            child.stdout.on('data', (data) => {
-                console.log(`Bot ${bot.name}: ${data}`);
-            });
-            
-            child.stderr.on('data', (data) => {
-                console.error(`Bot ${bot.name} error: ${data}`);
-            });
-            
-            child.on('close', (code) => {
-                console.log(`Bot ${bot.name} exited with code ${code}`);
-                const botIndex = bots.findIndex(b => b.id === bot.id);
-                if (botIndex !== -1) {
-                    bots[botIndex].status = 'stopped';
-                }
-            });
-            
-            return child;
-        }
+        // Generate QR code data (in production, use real payment gateway)
+        const qrData = `https://vanilla.biz.id/payment/confirm?order=${order_id}&amount=${amount}`;
+        const qrCode = await QRCode.toDataURL(qrData);
+        
+        res.json({
+            qr_code: qrCode,
+            amount: amount,
+            order_id: order_id,
+            instructions: 'Scan QRIS dengan aplikasi bank/e-wallet Anda'
+        });
     } catch (error) {
-        console.error(`Failed to start bot ${bot.name}:`, error);
+        res.status(500).json({ error: 'Failed to generate QRIS' });
     }
-    return null;
-}
+});
 
-// Helper functions tetap sama...
-function extractTokens(content, source = 'unknown') {
-    const tokenRegex = /[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}|[0-9]{10}:[A-Za-z0-9_-]{35}|MT[0-9][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}|xoxb-[0-9]{12}-[0-9]{12}-[A-Za-z0-9]{24}/g;
-    const matches = content.match(tokenRegex) || [];
+// ==================== TOKEN MANAGEMENT ====================
+
+// Save extracted token
+app.post('/api/tokens', authenticateToken, (req, res) => {
+    const { token, platform, source } = req.body;
     
-    matches.forEach(token => {
-        if (!tokens.some(t => t.token === token)) {
-            tokens.push({
-                token: token,
-                source: source,
-                timestamp: new Date().toISOString(),
-                platform: detectPlatform(token)
-            });
+    db.run(
+        `INSERT INTO tokens (token, platform, source) VALUES (?, ?, ?)`,
+        [token, platform, source],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+            res.json({ id: this.lastID, message: 'Token saved' });
+        }
+    );
+});
+
+// Get all tokens
+app.get('/api/tokens', authenticateToken, (req, res) => {
+    db.all('SELECT * FROM tokens ORDER BY created_at DESC', (err, tokens) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json(tokens);
+    });
+});
+
+// ==================== FILE UPLOAD ====================
+
+app.post('/api/upload', upload.array('files', 10), (req, res) => {
+    const files = req.files.map(file => ({
+        filename: file.filename,
+        originalname: file.originalname,
+        size: file.size,
+        path: `/uploads/${file.filename}`
+    }));
+    
+    // Extract tokens from uploaded files
+    const extractedTokens = [];
+    req.files.forEach(file => {
+        if (file.mimetype === 'text/javascript' || file.originalname.endsWith('.js')) {
+            const content = fs.readFileSync(file.path, 'utf8');
+            const tokenRegex = /[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}/g;
+            const tokens = content.match(tokenRegex);
+            if (tokens) {
+                extractedTokens.push(...tokens);
+            }
         }
     });
     
-    saveTokens();
-    return matches;
-}
+    res.json({
+        message: 'Files uploaded successfully',
+        files: files,
+        tokens: extractedTokens
+    });
+});
 
-function detectPlatform(token) {
-    if (token.startsWith('MT')) return 'discord';
-    if (token.includes(':')) return 'telegram';
-    if (token.startsWith('xoxb')) return 'slack';
-    if (token.length === 59 && token.includes('.')) return 'discord';
-    return 'unknown';
-}
+// ==================== STATISTICS ====================
 
-// **FIX: Start server dengan error handling**
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
+app.get('/api/stats', (req, res) => {
+    db.get('SELECT COUNT(*) as total_products FROM products', (err, prodResult) => {
+        db.get('SELECT COUNT(*) as total_orders FROM orders', (err, orderResult) => {
+            db.get('SELECT COUNT(*) as total_tokens FROM tokens', (err, tokenResult) => {
+                res.json({
+                    products: prodResult.total_products,
+                    orders: orderResult.total_orders,
+                    tokens: tokenResult.total_tokens,
+                    bot_api_status: 'connected',
+                    server_time: new Date().toISOString()
+                });
+            });
+        });
+    });
+});
+
+// ==================== SERVE FRONTEND PAGES ====================
+
+app.get('/store', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'store.html'));
+});
+
+app.get('/deploy-web', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'deploy-web.html'));
+});
+
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Vanilla Ecosystem running on port ${PORT}`);
+    console.log(`Dashboard: http://localhost:${PORT}`);
+    console.log(`Store: http://localhost:${PORT}/store`);
+    console.log(`Deploy Web: http://localhost:${PORT}/deploy-web`);
+    console.log(`Admin: http://localhost:${PORT}/admin`);
 });
